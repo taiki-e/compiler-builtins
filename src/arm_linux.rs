@@ -1,10 +1,17 @@
 use core::intrinsics;
 use core::mem;
 
+// TODO: port from portable-atomic.
+
 // Kernel-provided user-mode helper functions:
 // https://www.kernel.org/doc/Documentation/arm/kernel_user_helpers.txt
 unsafe fn __kuser_cmpxchg(oldval: u32, newval: u32, ptr: *mut u32) -> bool {
     let f: extern "C" fn(u32, u32, *mut u32) -> u32 = mem::transmute(0xffff0fc0usize as *const ());
+    f(oldval, newval, ptr) == 0
+}
+unsafe fn __kuser_cmpxchg64(oldval: *const u64, newval: *const u64, ptr: *mut u64) -> bool {
+    let f: extern "C" fn(*const u64, *const u64, *mut u64) -> u64 =
+        mem::transmute(0xffff0f60usize as *const ());
     f(oldval, newval, ptr) == 0
 }
 unsafe fn __kuser_memory_barrier() {
@@ -54,6 +61,27 @@ fn insert_aligned(aligned: u32, val: u32, shift: u32, mask: u32) -> u32 {
     (aligned & !(mask << shift)) | ((val & mask) << shift)
 }
 
+// 64-bit atomic load by two 32-bit atomic loads.
+#[inline]
+unsafe fn byte_wise_atomic_load(src: *const u64) -> u64 {
+    let (out_lo, out_hi);
+    asm!(
+        "ldr {out_lo}, [{src}]",
+        "ldr {out_hi}, [{src}, #4]",
+        src = in(reg) src,
+        out_lo = out(reg) out_lo,
+        out_hi = out(reg) out_hi,
+        options(pure, nostack, preserves_flags, readonly),
+    );
+    U64 {
+        pair: Pair {
+            lo: out_lo,
+            hi: out_hi,
+        },
+    }
+    .whole
+}
+
 // Generic atomic read-modify-write operation
 unsafe fn atomic_rmw<T, F: Fn(u32) -> u32, G: Fn(u32, u32) -> u32>(ptr: *mut T, f: F, g: G) -> u32 {
     let aligned_ptr = align_ptr(ptr);
@@ -65,6 +93,19 @@ unsafe fn atomic_rmw<T, F: Fn(u32) -> u32, G: Fn(u32, u32) -> u32>(ptr: *mut T, 
         let newval = f(curval);
         let newval_aligned = insert_aligned(curval_aligned, newval, shift, mask);
         if __kuser_cmpxchg(curval_aligned, newval_aligned, aligned_ptr) {
+            return g(curval, newval);
+        }
+    }
+}
+unsafe fn atomic_rmw64<F: Fn(u64) -> u64, G: Fn(u64, u64) -> u64>(
+    ptr: *mut u64,
+    f: F,
+    g: G,
+) -> u64 {
+    loop {
+        let curval = byte_wise_atomic_load(ptr);
+        let newval = f(curval);
+        if __kuser_cmpxchg64(curval, newval, ptr) {
             return g(curval, newval);
         }
     }
@@ -87,6 +128,17 @@ unsafe fn atomic_cmpxchg<T>(ptr: *mut T, oldval: u32, newval: u32) -> u32 {
         }
     }
 }
+unsafe fn atomic_cmpxchg64(ptr: *mut u64, oldval: u64, newval: u64) -> u64 {
+    loop {
+        let curval = byte_wise_atomic_load(aligned_ptr);
+        if curval != oldval {
+            return curval;
+        }
+        if __kuser_cmpxchg(curval, newval, ptr) {
+            return oldval;
+        }
+    }
+}
 
 macro_rules! atomic_rmw {
     ($name:ident, $ty:ty, $op:expr, $fetch:expr) => {
@@ -105,11 +157,37 @@ macro_rules! atomic_rmw {
         atomic_rmw!($name, $ty, $op, |_, new| new);
     };
 }
+macro_rules! atomic_rmw64 {
+    ($name:ident, $ty:ty, $op:expr, $fetch:expr) => {
+        intrinsics! {
+            pub unsafe extern "C" fn $name(ptr: *mut u64, val: u64) -> u64 {
+                atomic_rmw64(ptr, |x| $op(x, val), |old, new| $fetch(old, new))
+            }
+        }
+    };
+
+    (@old $name:ident, $ty:ty, $op:expr) => {
+        atomic_rmw64!($name, $ty, $op, |old, _| old);
+    };
+
+    (@new $name:ident, $ty:ty, $op:expr) => {
+        atomic_rmw64!($name, $ty, $op, |_, new| new);
+    };
+}
 macro_rules! atomic_cmpxchg {
     ($name:ident, $ty:ty) => {
         intrinsics! {
             pub unsafe extern "C" fn $name(ptr: *mut $ty, oldval: $ty, newval: $ty) -> $ty {
                 atomic_cmpxchg(ptr, oldval as u32, newval as u32) as $ty
+            }
+        }
+    };
+}
+macro_rules! atomic_cmpxchg64 {
+    ($name:ident) => {
+        intrinsics! {
+            pub unsafe extern "C" fn $name(ptr: *mut u64, oldval: u64, newval: u64) -> u64 {
+                atomic_cmpxchg(ptr, oldval, newval)
             }
         }
     };
@@ -120,24 +198,28 @@ atomic_rmw!(@old __sync_fetch_and_add_2, u16, |a: u16, b: u16| a
     .wrapping_add(b));
 atomic_rmw!(@old __sync_fetch_and_add_4, u32, |a: u32, b: u32| a
     .wrapping_add(b));
+atomic_rmw64!(@old __sync_fetch_and_add_8, |a: u64, b: u64| a.wrapping_add(b));
 
 atomic_rmw!(@new __sync_add_and_fetch_1, u8, |a: u8, b: u8| a.wrapping_add(b));
 atomic_rmw!(@new __sync_add_and_fetch_2, u16, |a: u16, b: u16| a
     .wrapping_add(b));
 atomic_rmw!(@new __sync_add_and_fetch_4, u32, |a: u32, b: u32| a
     .wrapping_add(b));
+atomic_rmw64!(@new __sync_add_and_fetch_8, |a: u64, b: u64| a.wrapping_add(b));
 
 atomic_rmw!(@old __sync_fetch_and_sub_1, u8, |a: u8, b: u8| a.wrapping_sub(b));
 atomic_rmw!(@old __sync_fetch_and_sub_2, u16, |a: u16, b: u16| a
     .wrapping_sub(b));
 atomic_rmw!(@old __sync_fetch_and_sub_4, u32, |a: u32, b: u32| a
     .wrapping_sub(b));
+atomic_rmw64!(@old __sync_fetch_and_sub_8, |a: u64, b: u64| a.wrapping_sub(b));
 
 atomic_rmw!(@new __sync_sub_and_fetch_1, u8, |a: u8, b: u8| a.wrapping_sub(b));
 atomic_rmw!(@new __sync_sub_and_fetch_2, u16, |a: u16, b: u16| a
     .wrapping_sub(b));
 atomic_rmw!(@new __sync_sub_and_fetch_4, u32, |a: u32, b: u32| a
     .wrapping_sub(b));
+atomic_rmw64!(@new __sync_sub_and_fetch_8, |a: u64, b: u64| a.wrapping_sub(b));
 
 atomic_rmw!(@old __sync_fetch_and_and_1, u8, |a: u8, b: u8| a & b);
 atomic_rmw!(@old __sync_fetch_and_and_2, u16, |a: u16, b: u16| a & b);
